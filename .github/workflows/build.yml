@@ -1,0 +1,191 @@
+# ArcBox build.yml
+# rev: 2 (成果物 3 点構成 / ViviMusic rev29-workflow3 と同じ命名・同じ流れ)
+#
+# 成果物は 3 つ。すべて JST のビルド時刻を頭に付ける。
+#   <stamp>_ArcBox-ipa
+#   <stamp>_xcodebuild-log
+#   <stamp>_Repository      … 中身は ArcBox/ で包む
+# 例: 2026-08-12T07-41-05+09-00_ArcBox-ipa.zip
+#
+# 時刻は最初のステップで 1 度だけ決め、3 つで同じ値を使う。
+# (ステップごとに date を呼ぶと数秒ずれて対応が取れなくなる)
+name: Build unsigned ipa
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Set build timestamp (JST)
+        run: |
+          STAMP=$(TZ=Asia/Tokyo date +'%Y-%m-%dT%H-%M-%S+09-00')
+          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
+          echo "Build stamp: $STAMP"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # xcodegen / xcodebuild / SPM キャッシュ復元より前に退避する。
+      # 後で取ると ArcBox.xcodeproj や build/ や .spm-cache/ が混ざる。
+      #
+      # ArcBox/ で包むのは、展開先を間違えたときの事故を防ぐため。
+      # 包まないと ZIP の中身が展開したフォルダに直接ばら撒かれ、
+      # 既存の作業ディレクトリに重ねてしまう危険がある。
+      - name: Snapshot repository
+        run: |
+          mkdir -p /tmp/repo-snapshot/ArcBox
+          rsync -a --exclude='.git' ./ /tmp/repo-snapshot/ArcBox/
+          echo "=== snapshot ==="
+          find /tmp/repo-snapshot -type f | wc -l
+          du -sh /tmp/repo-snapshot
+          ls -a /tmp/repo-snapshot/ArcBox
+
+      # ビルドが落ちても中身を確認できるよう always。
+      - name: Upload repository snapshot (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_Repository
+          path: /tmp/repo-snapshot
+          # .github/ や .gitignore を落とさないために必須。
+          # v4.4 以降は既定で隠しファイルが除外される。
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          mkdir -p /tmp/build-logs
+          {
+            echo "=== xcodebuild ==="; xcodebuild -version
+            echo "=== swift ==="; swift --version
+            echo "=== available SDKs ==="; xcodebuild -showsdks
+          } 2>&1 | tee /tmp/build-logs/toolchain.log
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/build-logs
+          xcodegen generate 2>&1 | tee /tmp/build-logs/xcodegen.log
+          ls -la
+          test -d ArcBox.xcodeproj && echo "OK" || (echo "xcodeproj not generated"; exit 1)
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .spm-cache
+          key: spm-${{ runner.os }}-${{ hashFiles('project.yml') }}
+
+      # continue-on-error は使わない。失敗したらここで止める。
+      # pipefail + tee でログは /tmp/build-logs/xcodebuild.log に常時保存。
+      - name: Build (no codesign)
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/build-logs
+          xcodebuild build \
+            -project ArcBox.xcodeproj \
+            -scheme ArcBox \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -clonedSourcePackagesDirPath .spm-cache \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee /tmp/build-logs/xcodebuild.log
+
+      - name: Show build log tail
+        if: always()
+        run: |
+          echo "=== Last 200 lines of xcodebuild log ==="
+          tail -200 /tmp/build-logs/xcodebuild.log || true
+
+      # 失敗時は error 行だけ Step Summary に出す（iPad から一目で見る用）。
+      # 成果物は増やさない。
+      - name: Summarize errors
+        if: failure()
+        run: |
+          echo "## ビルド失敗" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /tmp/build-logs/xcodebuild.log ]; then
+            echo '### error 行' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -nE "error:|fatal error|Command .* failed|The following build commands failed" \
+              /tmp/build-logs/xcodebuild.log | head -60 >> "$GITHUB_STEP_SUMMARY" || echo "(error 行なし)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "xcodebuild.log がありません（xcodegen 以前で失敗した可能性）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # error / warning だけ抜き出したものをログ成果物に同梱する。
+      - name: Extract errors and warnings
+        if: always()
+        run: |
+          mkdir -p /tmp/build-logs
+          if [ -f /tmp/build-logs/xcodebuild.log ]; then
+            grep -nE "error:|fatal error|Command .* failed|The following build commands failed" \
+              /tmp/build-logs/xcodebuild.log > /tmp/build-logs/errors.txt 2>/dev/null || true
+            grep -nE "warning:" /tmp/build-logs/xcodebuild.log > /tmp/build-logs/warnings.txt 2>/dev/null || true
+          fi
+          ls -la /tmp/build-logs
+
+      # 成功時のログも見たいので常時アップロード。エラー原因の追跡に必須。
+      - name: Upload xcodebuild log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_xcodebuild-log
+          path: /tmp/build-logs
+          if-no-files-found: warn
+
+      - name: Inspect PLzmaSDK API
+        run: |
+          SRC=$(find .spm-cache -type d -path '*PLzmaSDK*/swift' | head -1)
+          echo "swift sources: $SRC"
+          ls "$SRC"
+          echo "----- FileType / Method の列挙子 -----"
+          grep -n "case " "$SRC/FileType.swift" || true
+          grep -n "case " "$SRC/Method.swift" || true
+          echo "----- Item properties（中身一覧の実装用） -----"
+          grep -n "public var" -B 2 "$SRC/Item.swift" || true
+          echo "----- Decoder public methods -----"
+          grep -n "public func" "$SRC/Decoder.swift" || true
+
+      - name: Verify .app
+        run: |
+          APP="build/Build/Products/Release-iphoneos/ArcBox.app"
+          test -d "$APP" || { echo "::error::$APP が生成されていません"; exit 1; }
+          test -f "$APP/ArcBox" || { echo "::error::実行バイナリがありません"; exit 1; }
+          test -f "$APP/Info.plist" || { echo "::error::Info.plist がありません"; exit 1; }
+          file "$APP/ArcBox"
+          ls -la "$APP"
+
+      - name: Package ipa
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/ArcBox.app Payload/
+          zip -qry ArcBox.ipa Payload
+          rm -rf Payload
+          echo "=== IPA info ==="
+          ls -lh ArcBox.ipa
+          unzip -l ArcBox.ipa | tail -3
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_ArcBox-ipa
+          path: ArcBox.ipa
