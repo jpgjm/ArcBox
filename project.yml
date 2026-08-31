@@ -1,0 +1,38 @@
+name: ArcBox
+
+options:
+  bundleIdPrefix: com.anony
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  minimumXcodeGenVersion: "2.38.0"
+
+packages:
+  PLzmaSDK:
+    url: https://github.com/OlehKulykov/PLzmaSDK.git
+    exactVersion: 1.6.1
+
+targets:
+  ArcBox:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    dependencies:
+      - package: PLzmaSDK
+        product: PLzmaSDK
+    settings:
+      base:
+        PRODUCT_NAME: ArcBox
+        PRODUCT_BUNDLE_IDENTIFIER: com.anony.arcbox
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: Resources/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        # SideStore での手動署名を前提にする（CI ではそもそも署名しない）
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
